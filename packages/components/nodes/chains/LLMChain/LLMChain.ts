@@ -1,16 +1,15 @@
 import { BaseLanguageModel, BaseLanguageModelCallOptions } from '@langchain/core/language_models/base'
 import { BaseLLMOutputParser, BaseOutputParser } from '@langchain/core/output_parsers'
-import { ChatPromptTemplate, FewShotPromptTemplate, PromptTemplate, HumanMessagePromptTemplate } from '@langchain/core/prompts'
+import { HumanMessage } from '@langchain/core/messages'
+import { ChatPromptTemplate, FewShotPromptTemplate, HumanMessagePromptTemplate, PromptTemplate } from '@langchain/core/prompts'
 import { OutputFixingParser } from 'langchain/output_parsers'
 import { LLMChain } from 'langchain/chains'
-import { ICommonObject, INode, INodeData, INodeOutputsValue, INodeParams } from '../../../src/Interface'
-import { ConsoleCallbackHandler, CustomChainHandler, additionalCallbacks } from '../../../src/handler'
+import { IVisionChatModal, ICommonObject, INode, INodeData, INodeOutputsValue, INodeParams } from '../../../src/Interface'
+import { additionalCallbacks, ConsoleCallbackHandler, CustomChainHandler } from '../../../src/handler'
 import { getBaseClasses, handleEscapeCharacters } from '../../../src/utils'
 import { checkInputs, Moderation, streamResponse } from '../../moderation/Moderation'
 import { formatResponse, injectOutputParser } from '../../outputparsers/OutputParserHelpers'
-import { ChatOpenAI } from '../../chatmodels/ChatOpenAI/FlowiseChatOpenAI'
-import { addImagesToMessages } from '../../../src/multiModalUtils'
-import { HumanMessage } from 'langchain/schema'
+import { addImagesToMessages, llmSupportsVision } from '../../../src/multiModalUtils'
 
 class LLMChain_Chains implements INode {
     label: string
@@ -111,7 +110,9 @@ class LLMChain_Chains implements INode {
             })
             const inputVariables = chain.prompt.inputVariables as string[] // ["product"]
             promptValues = injectOutputParser(this.outputParser, chain, promptValues)
-            const res = await runPrediction(inputVariables, chain, input, promptValues, options, nodeData)
+            // Disable streaming because its not final chain
+            const disableStreaming = true
+            const res = await runPrediction(inputVariables, chain, input, promptValues, options, nodeData, disableStreaming)
             // eslint-disable-next-line no-console
             console.log('\x1b[92m\x1b[1m\n*****OUTPUT PREDICTION*****\n\x1b[0m\x1b[0m')
             // eslint-disable-next-line no-console
@@ -155,16 +156,16 @@ const runPrediction = async (
     input: string,
     promptValuesRaw: ICommonObject | undefined,
     options: ICommonObject,
-    nodeData: INodeData
+    nodeData: INodeData,
+    disableStreaming?: boolean
 ) => {
     const loggerHandler = new ConsoleCallbackHandler(options.logger)
     const callbacks = await additionalCallbacks(nodeData, options)
 
-    const isStreaming = options.socketIO && options.socketIOClientId
+    const isStreaming = !disableStreaming && options.socketIO && options.socketIOClientId
     const socketIO = isStreaming ? options.socketIO : undefined
     const socketIOClientId = isStreaming ? options.socketIOClientId : ''
     const moderations = nodeData.inputs?.inputModeration as Moderation[]
-    let model = nodeData.inputs?.model as ChatOpenAI
 
     if (moderations && moderations.length > 0) {
         try {
@@ -183,24 +184,39 @@ const runPrediction = async (
      * TO: { "value": "hello i am ben\n\n\thow are you?" }
      */
     const promptValues = handleEscapeCharacters(promptValuesRaw, true)
-    const messageContent = addImagesToMessages(nodeData, options, model.multiModalOption)
 
-    if (chain.llm instanceof ChatOpenAI) {
-        const chatOpenAI = chain.llm as ChatOpenAI
+    if (llmSupportsVision(chain.llm)) {
+        const visionChatModel = chain.llm as IVisionChatModal
+        const messageContent = await addImagesToMessages(nodeData, options, visionChatModel.multiModalOption)
         if (messageContent?.length) {
             // Change model to gpt-4-vision && max token to higher when using gpt-4-vision
-            chatOpenAI.modelName = 'gpt-4-vision-preview'
-            chatOpenAI.maxTokens = 1024
+            visionChatModel.setVisionModel()
             // Add image to the message
             if (chain.prompt instanceof PromptTemplate) {
                 const existingPromptTemplate = chain.prompt.template as string
-                let newChatPromptTemplate = ChatPromptTemplate.fromMessages([
-                    HumanMessagePromptTemplate.fromTemplate(existingPromptTemplate)
+                const msg = HumanMessagePromptTemplate.fromTemplate([
+                    ...messageContent,
+                    {
+                        text: existingPromptTemplate
+                    }
                 ])
-                newChatPromptTemplate.promptMessages.push(new HumanMessage({ content: messageContent }))
-                chain.prompt = newChatPromptTemplate
+                msg.inputVariables = chain.prompt.inputVariables
+                chain.prompt = ChatPromptTemplate.fromMessages([msg])
             } else if (chain.prompt instanceof ChatPromptTemplate) {
-                chain.prompt.promptMessages.push(new HumanMessage({ content: messageContent }))
+                if (chain.prompt.promptMessages.at(-1) instanceof HumanMessagePromptTemplate) {
+                    const lastMessage = chain.prompt.promptMessages.pop() as HumanMessagePromptTemplate
+                    const template = (lastMessage.prompt as PromptTemplate).template as string
+                    const msg = HumanMessagePromptTemplate.fromTemplate([
+                        ...messageContent,
+                        {
+                            text: template
+                        }
+                    ])
+                    msg.inputVariables = lastMessage.inputVariables
+                    chain.prompt.promptMessages.push(msg)
+                } else {
+                    chain.prompt.promptMessages.push(new HumanMessage({ content: messageContent }))
+                }
             } else if (chain.prompt instanceof FewShotPromptTemplate) {
                 let existingFewShotPromptTemplate = chain.prompt.examplePrompt.template as string
                 let newFewShotPromptTemplate = ChatPromptTemplate.fromMessages([
@@ -212,8 +228,7 @@ const runPrediction = async (
             }
         } else {
             // revert to previous values if image upload is empty
-            chatOpenAI.modelName = model.configuredModel
-            chatOpenAI.maxTokens = model.configuredMaxToken
+            visionChatModel.revertToOriginalModel()
         }
     }
 
